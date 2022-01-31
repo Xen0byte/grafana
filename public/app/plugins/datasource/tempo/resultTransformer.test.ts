@@ -1,6 +1,6 @@
-import { FieldType, MutableDataFrame } from '@grafana/data';
-import { createTableFrame, transformToOTLP, transformFromOTLP } from './resultTransformer';
-import { otlpDataFrameToResponse, otlpDataFrameFromResponse, otlpResponse } from './testResponse';
+import { ArrayVector, FieldType, MutableDataFrame } from '@grafana/data';
+import { createTableFrame, transformToOTLP, transformFromOTLP, transformTrace } from './resultTransformer';
+import { badOTLPResponse, otlpDataFrameToResponse, otlpDataFrameFromResponse, otlpResponse } from './testResponse';
 import { collectorTypes } from '@opentelemetry/exporter-collector';
 
 describe('transformTraceList()', () => {
@@ -52,5 +52,72 @@ describe('transformFromOTLP()', () => {
       false
     );
     expect(res.data[0]).toMatchObject(otlpDataFrameFromResponse);
+  });
+});
+
+describe('transformFromOTLP()', () => {
+  // Mock the console error so that running the test suite doesnt throw the error
+  const origError = console.error;
+  const consoleErrorMock = jest.fn();
+  afterEach(() => (console.error = origError));
+  beforeEach(() => (console.error = consoleErrorMock));
+
+  test('if passed bad data, will surface an error', () => {
+    const res = transformFromOTLP(
+      (badOTLPResponse.batches as unknown) as collectorTypes.opentelemetryProto.trace.v1.ResourceSpans[],
+      false
+    );
+
+    expect(res.data[0]).toBeFalsy();
+    expect(res?.error?.message).toContain('JSON is not valid OpenTelemetry format');
+    // if it does have resources, no error will be thrown
+    expect({
+      ...res.data[0],
+      resources: {
+        attributes: [
+          { key: 'service.name', value: { stringValue: 'db' } },
+          { key: 'job', value: { stringValue: 'tns/db' } },
+          { key: 'opencensus.exporterversion', value: { stringValue: 'Jaeger-Go-2.22.1' } },
+          { key: 'host.name', value: { stringValue: '63d16772b4a2' } },
+          { key: 'ip', value: { stringValue: '0.0.0.0' } },
+          { key: 'client-uuid', value: { stringValue: '39fb01637a579639' } },
+        ],
+      },
+    }).not.toBeFalsy();
+  });
+});
+
+describe('transformTrace()', () => {
+  // Mock the console error so that running the test suite doesnt throw the error
+  const origError = console.error;
+  const consoleErrorMock = jest.fn();
+  afterEach(() => (console.error = origError));
+  beforeEach(() => (console.error = consoleErrorMock));
+
+  const badFrame = new MutableDataFrame({
+    fields: [
+      {
+        name: 'serviceTags',
+        values: new ArrayVector([undefined]),
+      },
+    ],
+  });
+
+  const goodFrame = new MutableDataFrame({
+    fields: [
+      {
+        name: 'serviceTags',
+        values: new ArrayVector(),
+      },
+    ],
+  });
+
+  test('if passed bad data, will surface an error', () => {
+    const response = transformTrace({ data: [badFrame] }, false);
+    expect(response.data[0]).toBeFalsy();
+    expect(response?.error?.message).toContain('JSON is not valid OpenTelemetry format');
+
+    const response2 = transformTrace({ data: [goodFrame] }, false);
+    expect(response2.data[0]).not.toBeFalsy();
   });
 });
