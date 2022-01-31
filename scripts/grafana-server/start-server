@@ -13,6 +13,9 @@ echo -e "Copying grafana backend files to temp dir..."
 
 if [[ ! -f bin/linux-amd64/grafana-server ]]; then
   echo "bin/linux-amd64/grafana-server missing, trying local grafana-server binary"
+elif [[ ! -f bin/grafana-server ]]; then
+  echo "grafana-server binary is missing"
+  exit 1
 fi
 
 echo starting server
