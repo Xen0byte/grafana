@@ -1,21 +1,25 @@
-import React, { FC } from 'react';
-
-import { Button, LinkButton, Tooltip } from '@grafana/ui';
+import { Button, LinkButton, Menu, Tooltip } from '@grafana/ui';
 
 import { usePluginBridge } from '../../hooks/usePluginBridge';
-import { SupportedPlugin } from '../../types/pluginBridges';
+import { getIrmIfPresentOrIncidentPluginId } from '../../utils/config';
 import { createBridgeURL } from '../PluginBridge';
 
 interface Props {
   title?: string;
-  severity?: 'minor' | 'major' | 'critical';
+  severity?: 'minor' | 'major' | 'critical' | '';
   url?: string;
 }
 
-export const DeclareIncident: FC<Props> = ({ title = '', severity = '', url = '' }) => {
-  const bridgeURL = createBridgeURL(SupportedPlugin.Incident, '/incidents/declare', { title, severity, url });
+const pluginId = getIrmIfPresentOrIncidentPluginId();
 
-  const { loading, installed, settings } = usePluginBridge(SupportedPlugin.Incident);
+export const DeclareIncidentButton = ({ title = '', severity = '', url = '' }: Props) => {
+  const bridgeURL = createBridgeURL(pluginId, '/incidents/declare', {
+    title,
+    severity,
+    url,
+  });
+
+  const { loading, installed, settings } = usePluginBridge(pluginId);
 
   return (
     <>
@@ -36,6 +40,28 @@ export const DeclareIncident: FC<Props> = ({ title = '', severity = '', url = ''
           Declare Incident
         </LinkButton>
       )}
+    </>
+  );
+};
+
+export const DeclareIncidentMenuItem = ({ title = '', severity = '', url = '' }: Props) => {
+  const bridgeURL = createBridgeURL(pluginId, '/incidents/declare', {
+    title,
+    severity,
+    url,
+  });
+
+  const { loading, installed, settings } = usePluginBridge(pluginId);
+
+  return (
+    <>
+      {loading === true && <Menu.Item label="Declare incident" icon="fire" disabled />}
+      {installed === false && (
+        <Tooltip content={'Grafana Incident is not installed or is not configured correctly'}>
+          <Menu.Item label="Declare incident" icon="fire" disabled />
+        </Tooltip>
+      )}
+      {settings && <Menu.Item label="Declare incident" url={bridgeURL} icon="fire" />}
     </>
   );
 };

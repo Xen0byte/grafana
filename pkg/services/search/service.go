@@ -5,14 +5,22 @@ import (
 	"sort"
 
 	"github.com/grafana/grafana/pkg/infra/db"
+	"github.com/grafana/grafana/pkg/infra/metrics"
 	"github.com/grafana/grafana/pkg/services/dashboards"
+	"github.com/grafana/grafana/pkg/services/dashboards/dashboardaccess"
+	"github.com/grafana/grafana/pkg/services/featuremgmt"
+	"github.com/grafana/grafana/pkg/services/folder"
 	"github.com/grafana/grafana/pkg/services/search/model"
+	"github.com/grafana/grafana/pkg/services/sqlstore/searchstore"
 	"github.com/grafana/grafana/pkg/services/star"
 	"github.com/grafana/grafana/pkg/services/user"
 	"github.com/grafana/grafana/pkg/setting"
+	"go.opentelemetry.io/otel"
 )
 
-func ProvideService(cfg *setting.Cfg, sqlstore db.DB, starService star.Service, dashboardService dashboards.DashboardService) *SearchService {
+var tracer = otel.Tracer("github.com/grafana/grafana/pkg/services/search")
+
+func ProvideService(cfg *setting.Cfg, sqlstore db.DB, starService star.Service, dashboardService dashboards.DashboardService, folderService folder.Service, features featuremgmt.FeatureToggles) *SearchService {
 	s := &SearchService{
 		Cfg: cfg,
 		sortOptions: map[string]model.SortOption{
@@ -21,6 +29,8 @@ func ProvideService(cfg *setting.Cfg, sqlstore db.DB, starService star.Service, 
 		},
 		sqlstore:         sqlstore,
 		starService:      starService,
+		folderService:    folderService,
+		features:         features,
 		dashboardService: dashboardService,
 	}
 	return s
@@ -34,18 +44,19 @@ type Query struct {
 	Limit         int64
 	Page          int64
 	IsStarred     bool
+	IsDeleted     bool
 	Type          string
 	DashboardUIDs []string
 	DashboardIds  []int64
-	FolderIds     []int64
-	Permission    dashboards.PermissionType
-	Sort          string
-
-	Result model.HitList
+	// Deprecated: use FolderUID instead
+	FolderIds  []int64
+	FolderUIDs []string
+	Permission dashboardaccess.PermissionType
+	Sort       string
 }
 
 type Service interface {
-	SearchHandler(context.Context, *Query) error
+	SearchHandler(context.Context, *Query) (model.HitList, error)
 	SortOptions() []model.SortOption
 }
 
@@ -55,76 +66,95 @@ type SearchService struct {
 	sqlstore         db.DB
 	starService      star.Service
 	dashboardService dashboards.DashboardService
+	folderService    folder.Service
+	features         featuremgmt.FeatureToggles
 }
 
-func (s *SearchService) SearchHandler(ctx context.Context, query *Query) error {
+func (s *SearchService) SearchHandler(ctx context.Context, query *Query) (model.HitList, error) {
+	ctx, span := tracer.Start(ctx, "search.SearchHandler")
+	defer span.End()
+
 	starredQuery := star.GetUserStarsQuery{
 		UserID: query.SignedInUser.UserID,
 	}
 	staredDashIDs, err := s.starService.GetByUser(ctx, &starredQuery)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// No starred dashboards will be found
 	if query.IsStarred && len(staredDashIDs.UserStars) == 0 {
-		query.Result = model.HitList{}
-		return nil
+		return model.HitList{}, nil
 	}
 
 	// filter by starred dashboard IDs when starred dashboards are requested and no UID or ID filters are specified to improve query performance
 	if query.IsStarred && len(query.DashboardIds) == 0 && len(query.DashboardUIDs) == 0 {
-		for id := range staredDashIDs.UserStars {
-			query.DashboardIds = append(query.DashboardIds, id)
+		for uid := range staredDashIDs.UserStars {
+			query.DashboardUIDs = append(query.DashboardUIDs, uid)
 		}
 	}
 
+	metrics.MFolderIDsServiceCount.WithLabelValues(metrics.Search).Inc()
 	dashboardQuery := dashboards.FindPersistedDashboardsQuery{
 		Title:         query.Title,
 		SignedInUser:  query.SignedInUser,
 		DashboardUIDs: query.DashboardUIDs,
 		DashboardIds:  query.DashboardIds,
 		Type:          query.Type,
-		FolderIds:     query.FolderIds,
+		FolderIds:     query.FolderIds, // nolint:staticcheck
+		FolderUIDs:    query.FolderUIDs,
 		Tags:          query.Tags,
 		Limit:         query.Limit,
 		Page:          query.Page,
 		Permission:    query.Permission,
+		IsDeleted:     query.IsDeleted,
 	}
 
 	if sortOpt, exists := s.sortOptions[query.Sort]; exists {
 		dashboardQuery.Sort = sortOpt
 	}
 
-	if err := s.dashboardService.SearchDashboards(ctx, &dashboardQuery); err != nil {
-		return err
+	// if folders are stored in unified storage, we need to use the folder service to query for folders
+	if s.features.IsEnabledGlobally(featuremgmt.FlagKubernetesFoldersServiceV2) && (query.Type == searchstore.TypeFolder || query.Type == searchstore.TypeAlertFolder) {
+		hits, err := s.folderService.SearchFolders(ctx, folder.SearchFoldersQuery{
+			OrgID:        query.OrgId,
+			UIDs:         query.FolderUIDs,
+			IDs:          query.FolderIds,
+			Title:        query.Title,
+			Limit:        query.Limit,
+			SignedInUser: query.SignedInUser,
+		})
+
+		return sortedHits(hits), err
 	}
 
-	hits := dashboardQuery.Result
+	hits, err := s.dashboardService.SearchDashboards(ctx, &dashboardQuery)
+	if err != nil {
+		return nil, err
+	}
+
 	if query.Sort == "" {
 		hits = sortedHits(hits)
 	}
 
 	// set starred dashboards
 	for _, dashboard := range hits {
-		if _, ok := staredDashIDs.UserStars[dashboard.ID]; ok {
+		if _, ok := staredDashIDs.UserStars[dashboard.UID]; ok {
 			dashboard.IsStarred = true
 		}
 	}
 
 	// filter for starred dashboards if requested
 	if !query.IsStarred {
-		query.Result = hits
-	} else {
-		query.Result = model.HitList{}
-		for _, dashboard := range hits {
-			if dashboard.IsStarred {
-				query.Result = append(query.Result, dashboard)
-			}
+		return hits, nil
+	}
+	result := model.HitList{}
+	for _, dashboard := range hits {
+		if dashboard.IsStarred {
+			result = append(result, dashboard)
 		}
 	}
-
-	return nil
+	return result, nil
 }
 
 func sortedHits(unsorted model.HitList) model.HitList {
